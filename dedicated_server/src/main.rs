@@ -52,7 +52,7 @@ async fn main() {
                     if let Ok(json) = serde_json::to_string(&heartbeat) {
                         match peer.send(conn, &orchestrator_stream, Bytes::from(json)) {
                             Ok(_) => {
-                                let status = if registry.is_full(config.max_players) { "FULL" } else { "AVAILABLE" };
+                                let status = if registry.is_full(config.max_players) { "full" } else { "available" };
                                 println!("[INFO] Heartbeat sent via QUIC - Players: {}/{}, Status: {}",
                                          heartbeat.player_count, heartbeat.max_players, status);
                             }
