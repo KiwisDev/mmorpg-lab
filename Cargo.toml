@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
 
-members = ["dedicated_server", "gatekeeper", "orchestrator", "shared", "game_sockets", "temp_quic_client"]
+members = ["dedicated_server", "gatekeeper", "orchestrator", "shared", "game_sockets"]
 
 [workspace.dependencies]
 shared = { path = "shared"}
-game_sockets = { path = "game_sockets" }
+game_sockets = { path = "game_sockets"}
