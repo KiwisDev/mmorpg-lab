@@ -1,0 +1,3 @@
+[submodule "game_sockets"]
+	path = game_sockets
+	url = https://github.com/VALERE91/game_sockets.git
