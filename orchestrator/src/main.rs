@@ -1,33 +1,47 @@
+use std::time::Duration;
+use game_sockets::protocols::QuicBackend;
+use game_sockets::{GameNetworkEvent, GamePeer};
 use shared::Heartbeat;
-use tokio::net::UdpSocket;
 
 #[tokio::main]
 async fn main() {
-    let port = std::env::var("ORCH_PORT").unwrap_or("9000".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    let port: u16 = std::env::var("ORCH_PORT")
+        .unwrap_or("9000".to_string())
+        .parse()
+        .expect("ORCH_PORT must be a valid port number");
 
-    let socket = UdpSocket::bind(&addr).await.expect("Failed to bind UDP socket");
-    println!("Orchestrator listening on {}", addr);
-
-    let mut buf = vec![0u8; 1024];
+    let mut peer = GamePeer::new(QuicBackend::new());
+    peer.listen("0.0.0.0", port).expect("Failed to bind QUIC socket");
+    println!("Orchestrator listening on port {}", port);
 
     loop {
-        let (nb_bytes, sender) = socket
-            .recv_from(&mut buf)
-            .await
-            .expect("Failed to receive data");
-
-        match serde_json::from_slice::<Heartbeat>(&buf[..nb_bytes]) {
-            Ok(heartbeat) => {
-                println!(
-                    "Heartbeat from server {} (zone: {}, players: {}/{})",
-                    heartbeat.id, heartbeat.zone, heartbeat.player_count, heartbeat.max_players
-                );
+        match peer.poll() {
+            Ok(Some(GameNetworkEvent::Connected(conn))) => {
+                println!("Server connected: {}", conn.connection_id);
             }
-            Err(_) => {
-                // Log unexpected messages so we can debug protocol mismatches.
-                let raw = String::from_utf8_lossy(&buf[..nb_bytes]);
-                println!("Unknown message from {}: {}", sender, raw);
+            Ok(Some(GameNetworkEvent::Disconnected(conn))) => {
+                println!("Server disconnected: {}", conn.connection_id);
+            }
+            Ok(Some(GameNetworkEvent::Message { data, .. })) => {
+                match serde_json::from_slice::<Heartbeat>(&data) {
+                    Ok(heartbeat) => {
+                        println!(
+                            "Heartbeat from server {} (zone: {}, players: {}/{})",
+                            heartbeat.id, heartbeat.zone, heartbeat.player_count, heartbeat.max_players
+                        );
+                    }
+                    Err(_) => {
+                        println!("Unknown message: {:?}", data);
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // No event yet — yield briefly to avoid busy-waiting.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => {
+                eprintln!("Network error: {}", e);
             }
         }
     }
