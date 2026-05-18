@@ -126,7 +126,7 @@ fn send_heartbeat(
         if let Some(conn) = &orchestrator.connection {
             let heartbeat = Heartbeat {
                 id: config.id.clone(),
-                ip: "0.0.0.0".to_string(),
+                ip: "127.0.0.1".to_string(),
                 port: config.port,
                 zone: config.zone.clone(),
                 player_count: registry.get_player_count(),
