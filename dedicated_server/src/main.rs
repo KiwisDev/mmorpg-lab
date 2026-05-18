@@ -1,9 +1,11 @@
 mod resources;
 
+use bytes::Bytes;
 use resources::{ServerConfig, PlayerRegistry};
 use shared::Heartbeat;
-use tokio::net::UdpSocket;
 use tokio::time::{interval, Duration};
+use game_sockets::{GamePeer, GameNetworkEvent, GameStreamReliability, GameConnection, GameStream};
+use game_sockets::protocols::QuicBackend;
 
 #[tokio::main]
 async fn main() {
@@ -12,79 +14,109 @@ async fn main() {
 
     println!("[INFO] Dedicated Game Server started");
     println!("[INFO] Server ID: {}", config.id);
-    println!("[INFO] Listening on: 127.0.0.1:{}", config.port);
+    println!("[INFO] Listening on: 0.0.0.0:{}", config.port);
     println!("[INFO] Zone: {}", config.zone);
     println!("[INFO] Max players: {}", config.max_players);
     println!("[INFO] Orchestrator address: {}", config.orchestrator_addr);
 
-    // Bind UDP socket
-    let addr = format!("127.0.0.1:{}", config.port);
-    let socket = UdpSocket::bind(&addr)
-        .await
-        .expect(&format!("Failed to bind socket on {}", addr));
+    // Bind Quic backend
+    let mut peer = GamePeer::new(QuicBackend::new());
+    if let Err(e) = peer.listen("0.0.0.0", config.port) {
+        eprintln!("[ERROR] Failed to bind Quic: {}", e);
+        return;
+    }
 
-    // Single-threaded event loop using tokio::select! to handle incoming packets and periodic heartbeats
+    // Connect to orchestrator for heartbeat via QUIC
+    if let Err(e) = peer.connect(&config.orchestrator_addr.ip().to_string(), config.orchestrator_addr.port()) {
+        eprintln!("[ERROR] Failed to connect to orchestrator: {}", e);
+        return;
+    }
+
     let mut interval_timer = interval(Duration::from_secs(5));
-    let mut buf = [0u8; 1024];
+    let mut orchestrator_conn: Option<GameConnection> = None;
+    let orchestrator_stream = GameStream::new(0, GameStreamReliability::Unreliable);
 
     loop {
         tokio::select! {
-            res = socket.recv_from(&mut buf) => {
-                match res {
-                    Ok((size, addr)) => {
-                        let message = String::from_utf8_lossy(&buf[..size]);
-                        println!("[DEBUG] Received message from {}: {}", addr, message);
-
-                        // Parse message: "JOIN username"
-                        if let Some(username) = message.strip_prefix("JOIN ") {
-                            let username = username.trim().to_string();
-
-                            // Verify if server is not full
-                            if !registry.is_full(config.max_players) {
-                                let player = registry.add_player(addr, username.clone());
-                                println!("[INFO] Player {} connected from {} with ID: {}", username, addr, player.id);
-
-                                // Send WELCOME response
-                                let response = format!("WELCOME {}", player.id);
-                                let _ = socket.send_to(response.as_bytes(), addr).await;
-                                println!("[DEBUG] Sent WELCOME response to {}", addr);
-                            } else {
-                                println!("[WARN] Server is full, rejected connection from {} ({})", addr, username);
-                                let response = "FULL";
-                                let _ = socket.send_to(response.as_bytes(), addr).await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Ignore Windows error 10054 (ICMP port unreachable from heartbeat)
-                        if e.raw_os_error() == Some(10054) {
-                            // Silent continue - this is expected behavior when orchestrator is not listening
-                            continue;
-                        }
-                        eprintln!("[ERROR] Error receiving packet: {}", e);
-                        break;
-                    }
-                }
-            }
             _ = interval_timer.tick() => {
                 let heartbeat = Heartbeat {
                     id: config.id.clone(),
-                    ip: "127.0.0.1".to_string(),
+                    ip: "0.0.0.0".to_string(),
                     port: config.port,
                     zone: config.zone.clone(),
                     player_count: registry.get_player_count(),
                     max_players: config.max_players,
                 };
 
-                if let Ok(json) = serde_json::to_string(&heartbeat) {
-                    match socket.send_to(json.as_bytes(), config.orchestrator_addr).await {
-                        Ok(_) => {
-                            let status = if registry.is_full(config.max_players) { "FULL" } else { "AVAILABLE" };
-                            println!("[INFO] Heartbeat sent - Players: {}/{}, Status: {}",
-                                     heartbeat.player_count, heartbeat.max_players, status);
+                if let Some(conn) = &orchestrator_conn {
+                    if let Ok(json) = serde_json::to_string(&heartbeat) {
+                        match peer.send(conn, &orchestrator_stream, Bytes::from(json)) {
+                            Ok(_) => {
+                                let status = if registry.is_full(config.max_players) { "FULL" } else { "AVAILABLE" };
+                                println!("[INFO] Heartbeat sent via QUIC - Players: {}/{}, Status: {}",
+                                         heartbeat.player_count, heartbeat.max_players, status);
+                            }
+                            Err(e) => {
+                                eprintln!("[WARN] Failed to send heartbeat via QUIC: {}", e);
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("[WARN] Failed to send heartbeat: {} (orchestrator may not be listening)", e.kind());
+                    }
+                } else {
+                    println!("[WARN] Waiting for orchestrator connection to send heartbeat...");
+                }
+            }
+            // Add a small sleep to not spin loop if peer.poll is empty
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                while let Ok(Some(event)) = peer.poll() {
+                    match event {
+                        GameNetworkEvent::Connected(conn) => {
+                            if orchestrator_conn.is_none() {
+                                println!("[INFO] Orchestrator connected: {:?}", conn);
+                                orchestrator_conn = Some(conn);
+                            } else {
+                                println!("[INFO] Peer connected: {:?}", conn);
+                            }
+                        }
+                        GameNetworkEvent::Disconnected(conn) => {
+                            println!("[INFO] Peer disconnected: {:?}", conn);
+                            registry.remove_player(&conn);
+                            if Some(conn) == orchestrator_conn {
+                                orchestrator_conn = None;
+                                println!("[WARN] Orchestrator disconnected.");
+                            }
+                        }
+                        GameNetworkEvent::Message { connection, stream, data } => {
+                            let message = String::from_utf8_lossy(&data);
+                            println!("[DEBUG] Received message from {:?} on stream {:?}: {}", connection, stream, message);
+
+                            // Parse message: "JOIN username"
+                            if let Some(username) = message.strip_prefix("JOIN ") {
+                                let username = username.trim().to_string();
+
+                                // Verify if server is not full
+                                if !registry.is_full(config.max_players) {
+                                    let player = registry.add_player(connection.clone(), username.clone());
+                                    println!("[INFO] Player {} connected with ID: {}", username, player.id);
+
+                                    // Send WELCOME response
+                                    let response = format!("WELCOME {}", player.id);
+                                    let _ = peer.send(&connection, &stream, Bytes::from(response));
+                                    println!("[DEBUG] Sent WELCOME response");
+                                } else {
+                                    println!("[WARN] Server is full, rejected connection ({})", username);
+                                    let response = "FULL";
+                                    let _ = peer.send(&connection, &stream, Bytes::from(response));
+                                }
+                            }
+                        }
+                        GameNetworkEvent::Error { connection, inner } => {
+                            eprintln!("[ERROR] Network error for {:?}: {}", connection, inner);
+                        }
+                        GameNetworkEvent::StreamCreated(conn, stream) => {
+                             println!("[INFO] Stream created for {:?}: {:?}", conn, stream);
+                        }
+                        GameNetworkEvent::StreamClosed(conn, stream) => {
+                             println!("[INFO] Stream closed for {:?}: {:?}", conn, stream);
                         }
                     }
                 }

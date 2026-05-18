@@ -2,13 +2,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use uuid::Uuid;
+use game_sockets::GameConnection;
 
 /// Information sur un joueur connecté
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerInfo {
     pub id: String,
     pub username: String,
-    pub addr: SocketAddr,
+    #[serde(skip)]
+    pub conn: Option<GameConnection>,
 }
 
 /// Configuration du serveur de jeu dédié
@@ -25,7 +27,7 @@ impl ServerConfig {
     /// Charge la configuration depuis les variables d'environnement
     pub fn from_env() -> Self {
         let port = std::env::var("DS_PORT")
-            .unwrap_or_else(|_| "7001".to_string())
+            .unwrap_or_else(|_| "9000".to_string())
             .parse::<u16>()
             .expect("DS_PORT doit être un numéro de port valide");
 
@@ -37,7 +39,7 @@ impl ServerConfig {
             .expect("DS_MAX_PLAYERS doit être un nombre valide");
 
         let orchestrator_addr = std::env::var("ORCHESTRATOR_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:6001".to_string())
+            .unwrap_or_else(|_| "127.0.0.1:9000".to_string())
             .parse::<SocketAddr>()
             .expect("ORCHESTRATOR_ADDR doit être une adresse valide");
 
@@ -54,7 +56,7 @@ impl ServerConfig {
 /// Registre des joueurs connectés
 #[derive(Default, Debug)]
 pub struct PlayerRegistry {
-    pub players: HashMap<SocketAddr, PlayerInfo>,
+    pub players: HashMap<GameConnection, PlayerInfo>,
 }
 
 impl PlayerRegistry {
@@ -62,18 +64,18 @@ impl PlayerRegistry {
         Self::default()
     }
 
-    pub fn add_player(&mut self, addr: SocketAddr, username: String) -> PlayerInfo {
+    pub fn add_player(&mut self, conn: GameConnection, username: String) -> PlayerInfo {
         let player = PlayerInfo {
             id: Uuid::new_v4().to_string(),
             username,
-            addr,
+            conn: Some(conn),
         };
-        self.players.insert(addr, player.clone());
+        self.players.insert(conn, player.clone());
         player
     }
 
-    pub fn remove_player(&mut self, addr: SocketAddr) -> Option<PlayerInfo> {
-        self.players.remove(&addr)
+    pub fn remove_player(&mut self, conn: &GameConnection) -> Option<PlayerInfo> {
+        self.players.remove(conn)
     }
 
     pub fn get_player_count(&self) -> usize {
@@ -84,5 +86,3 @@ impl PlayerRegistry {
         self.players.len() >= max_players
     }
 }
-
-
