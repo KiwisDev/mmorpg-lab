@@ -1,4 +1,5 @@
-﻿use serde::{Deserialize, Serialize};
+﻿use bevy::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use uuid::Uuid;
@@ -14,7 +15,7 @@ pub struct PlayerInfo {
 }
 
 /// Configuration du serveur de jeu dédié
-#[derive(Debug, Clone)]
+#[derive(Resource, Debug, Clone)]
 pub struct ServerConfig {
     pub id: String,
     pub port: u16,
@@ -54,7 +55,7 @@ impl ServerConfig {
 }
 
 /// Registre des joueurs connectés
-#[derive(Default, Debug)]
+#[derive(Resource, Default, Debug)]
 pub struct PlayerRegistry {
     pub players: HashMap<GameConnection, PlayerInfo>,
 }
@@ -84,5 +85,19 @@ impl PlayerRegistry {
 
     pub fn is_full(&self, max_players: usize) -> bool {
         self.players.len() >= max_players
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct Orchestrator {
+    pub connection: Option<GameConnection>,
+}
+
+#[derive(Resource)]
+pub struct HeartbeatTimer(pub Timer);
+
+impl Default for HeartbeatTimer {
+    fn default() -> Self {
+        HeartbeatTimer(Timer::from_seconds(5.0, TimerMode::Repeating))
     }
 }
