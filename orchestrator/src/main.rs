@@ -72,8 +72,7 @@ async fn scaler_loop(mut redis_conn: redis::aio::MultiplexedConnection) {
         println!("[scaler] Available servers: {} (min: {})", available, hot_servers_min);
 
         for _ in available..hot_servers_min {
-            println!("[scaler] Not enough servers, spawning one...");
-            //TODO: Spawn server
+            spawn_server();
         }
     }
 }
@@ -89,6 +88,32 @@ async fn count_available_servers(redis_conn: &mut redis::aio::MultiplexedConnect
         }
     }
     count
+}
+
+fn find_free_port() -> u16 {
+    // Binding to port 0 lets the OS assign a free port; we read it then release the socket.
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to find free port");
+    socket.local_addr().unwrap().port()
+}
+
+fn spawn_server() {
+    let port = find_free_port();
+
+    // The dedicated_server binary sits next to this binary in the same target directory.
+    let mut binary_path = std::env::current_exe().expect("Failed to get current exe path");
+    binary_path.pop();
+    binary_path.push("dedicated_server");
+
+    let orch_addr = std::env::var("ORCH_ADDR").unwrap_or("127.0.0.1:9000".to_string());
+
+    match std::process::Command::new(&binary_path)
+        .env("DS_PORT", port.to_string())
+        .env("ORCHESTRATOR_ADDR", orch_addr)
+        .spawn()
+    {
+        Ok(_)  => println!("[scaler] Spawned dedicated_server on port {}", port),
+        Err(e) => eprintln!("[scaler] Failed to spawn dedicated_server: {}", e),
+    }
 }
 
 async fn register_server(redis_conn: &mut redis::aio::MultiplexedConnection, heartbeat: &Heartbeat) {
