@@ -4,8 +4,8 @@ use bevy::app::ScheduleRunnerPlugin;
 use std::time::Duration;
 use game_sockets::{GamePeer, GameNetworkEvent, GameStreamReliability, GameConnection, GameStream};
 use game_sockets::protocols::QuicBackend;
-use crate::resources::{ServerConfig, PlayerRegistry, HeartbeatTimer, Orchestrator};
-use shared::Heartbeat;
+use crate::resources::{ServerConfig, PlayerRegistry, HeartbeatTimer, Orchestrator, HandoffManager};
+use shared::{Heartbeat, EntityState, HandoffRequest, HandoffAccept, HandoffReject, HandoffComplete, GhostUpdate};
 use bytes::Bytes;
 
 mod resources;
@@ -25,24 +25,28 @@ fn main() {
         .insert_resource(ServerConfig::from_env())
         .init_resource::<PlayerRegistry>()
         .init_resource::<Orchestrator>()
+        .init_resource::<HandoffManager>()
         .init_resource::<HeartbeatTimer>()
         .add_systems(Startup, (setup_networking, connect_to_orchestrator).chain())
-        .add_systems(Update, (handle_network_events, send_heartbeat).chain())
+        .add_systems(Update, (
+            handle_network_events,
+            send_heartbeat,
+            process_handoff_timeouts,
+        ).chain())
         .run();
 }
 
 fn setup_networking(mut commands: Commands, config: Res<ServerConfig>) {
-    let mut peer = GamePeer::new(QuicBackend::new());
+    let peer = GamePeer::new(QuicBackend::new());
     if let Err(e) = peer.listen("0.0.0.0", config.port) {
         error!("[ERROR] Failed to bind Quic: {}", e);
-        // Consider exiting the app here
     } else {
         info!("[INFO] Listening on: 0.0.0.0:{}", config.port);
     }
     commands.insert_resource(GamePeerResource(peer));
 }
 
-fn connect_to_orchestrator(mut peer: ResMut<GamePeerResource>, config: Res<ServerConfig>) {
+fn connect_to_orchestrator(peer: ResMut<GamePeerResource>, config: Res<ServerConfig>) {
     info!("[INFO] Connecting to orchestrator at {}", config.orchestrator_addr);
     if let Err(e) = peer.0.connect(&config.orchestrator_addr.ip().to_string(), config.orchestrator_addr.port()) {
         error!("[ERROR] Failed to connect to orchestrator: {}", e);
@@ -53,6 +57,7 @@ fn handle_network_events(
     mut peer: ResMut<GamePeerResource>,
     mut registry: ResMut<PlayerRegistry>,
     mut orchestrator: ResMut<Orchestrator>,
+    mut handoff_mgr: ResMut<HandoffManager>,
     config: Res<ServerConfig>,
 ) {
     while let Ok(Some(event)) = peer.0.poll() {
@@ -80,6 +85,29 @@ fn handle_network_events(
 
                 if let Some(username) = message.strip_prefix("JOIN ") {
                     handle_join(username, connection, stream, &mut peer.0, &mut registry, config.max_players);
+                } else if message.starts_with("UPDATE_POS ") {
+                    // Format: "UPDATE_POS x y vx vy"
+                    let parts: Vec<&str> = message.strip_prefix("UPDATE_POS ").unwrap_or("").split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        if let (Ok(x), Ok(y), Ok(vx), Ok(vy)) = (
+                            parts[0].parse::<f32>(),
+                            parts[1].parse::<f32>(),
+                            parts[2].parse::<f32>(),
+                            parts[3].parse::<f32>(),
+                        ) {
+                            registry.update_position(&connection, x, y);
+                            registry.update_velocity(&connection, vx, vy);
+                        }
+                    }
+                } else if data.len() > 0 {
+                    match data[0] {
+                        0x20 => handle_handoff_request(&data, connection, &mut registry, &mut handoff_mgr, &mut peer.0),
+                        0x21 => handle_handoff_accept(&data, &mut registry, &mut handoff_mgr),
+                        0x22 => handle_handoff_reject(&data, &mut registry, &mut handoff_mgr),
+                        0x23 => handle_ghost_update(&data, &mut handoff_mgr),
+                        0x24 => handle_handoff_complete(&data, &mut registry, &mut handoff_mgr),
+                        _ => {}
+                    }
                 }
             }
             GameNetworkEvent::Error { connection, inner } => {
@@ -149,5 +177,181 @@ fn send_heartbeat(
         } else {
             warn!("[WARN] No orchestrator connection to send heartbeat.");
         }
+    }
+}
+
+fn send_handoff_accept(peer: &mut GamePeer, target_shard_conn: &GameConnection, entity_id: u32) {
+    let response = HandoffAccept { entity_id };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let mut msg = vec![0x21]; // HandoffAccept tag
+        msg.extend_from_slice(json.as_bytes());
+        let stream = GameStream::new(1, GameStreamReliability::Reliable);
+        let _ = peer.send(target_shard_conn, &stream, Bytes::from(msg));
+        info!("[INFO] HandoffAccept sent for entity {}", entity_id);
+    }
+}
+
+fn send_handoff_reject(peer: &mut GamePeer, target_shard_conn: &GameConnection, entity_id: u32) {
+    let response = HandoffReject { entity_id };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let mut msg = vec![0x22]; // HandoffReject tag
+        msg.extend_from_slice(json.as_bytes());
+        let stream = GameStream::new(1, GameStreamReliability::Reliable);
+        let _ = peer.send(target_shard_conn, &stream, Bytes::from(msg));
+        info!("[INFO] HandoffReject sent for entity {}", entity_id);
+    }
+}
+
+fn send_ghost_update(peer: &mut GamePeer, target_shard_conn: &GameConnection, entity_id: u32, pos_x: f32, pos_y: f32, vel_x: f32, vel_y: f32) {
+    let update = GhostUpdate {
+        entity_id,
+        pos_x,
+        pos_y,
+        vel_x,
+        vel_y,
+    };
+    if let Ok(json) = serde_json::to_string(&update) {
+        let mut msg = vec![0x23]; // GhostUpdate tag
+        msg.extend_from_slice(json.as_bytes());
+        let stream = GameStream::new(1, GameStreamReliability::Unreliable);
+        let _ = peer.send(target_shard_conn, &stream, Bytes::from(msg));
+    }
+}
+
+fn send_handoff_complete(peer: &mut GamePeer, target_shard_conn: &GameConnection, entity_id: u32) {
+    let response = HandoffComplete { entity_id };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let mut msg = vec![0x24]; // HandoffComplete tag
+        msg.extend_from_slice(json.as_bytes());
+        let stream = GameStream::new(1, GameStreamReliability::Reliable);
+        let _ = peer.send(target_shard_conn, &stream, Bytes::from(msg));
+        info!("[INFO] HandoffComplete sent for entity {}", entity_id);
+    }
+}
+
+fn handle_handoff_request(
+    data: &[u8],
+    conn: GameConnection,
+    registry: &mut PlayerRegistry,
+    handoff_mgr: &mut HandoffManager,
+    peer: &mut GamePeer,
+) {
+    if data.len() <= 1 {
+        return;
+    }
+
+    if let Ok(req) = serde_json::from_slice::<HandoffRequest>(&data[1..]) {
+        info!("[INFO] HandoffRequest received for entity {} at ({}, {})",
+              req.entity_id, req.pos_x, req.pos_y);
+
+        // Créer une copie Ghost localement
+        let ghost_player = resources::PlayerInfo {
+            id: req.entity_id.to_string(),
+            username: format!("ghost_{}", req.entity_id),
+            pos_x: req.pos_x,
+            pos_y: req.pos_y,
+            vel_x: req.vel_x,
+            vel_y: req.vel_y,
+            state: EntityState::Ghost,
+            owner_shard_id: None,
+            conn: Some(conn),
+        };
+
+        handoff_mgr.add_ghost(req.entity_id.to_string(), ghost_player);
+
+        // Accepter le handoff
+        send_handoff_accept(peer, &conn, req.entity_id);
+    }
+}
+
+fn handle_handoff_accept(
+    data: &[u8],
+    registry: &mut PlayerRegistry,
+    handoff_mgr: &mut HandoffManager,
+) {
+    if data.len() <= 1 {
+        return;
+    }
+
+    if let Ok(msg) = serde_json::from_slice::<HandoffAccept>(&data[1..]) {
+        info!("[INFO] HandoffAccept received for entity {}", msg.entity_id);
+
+        // L'entité est maintenant acceptée au shard destination
+        // Elle reste en état PendingHandoff localement jusqu'à HandoffComplete
+    }
+}
+
+fn handle_handoff_reject(
+    data: &[u8],
+    registry: &mut PlayerRegistry,
+    handoff_mgr: &mut HandoffManager,
+) {
+    if data.len() <= 1 {
+        return;
+    }
+
+    if let Ok(msg) = serde_json::from_slice::<HandoffReject>(&data[1..]) {
+        info!("[INFO] HandoffReject received for entity {}", msg.entity_id);
+
+        // Mettre à jour l'état de l'entité si elle existe localement
+        // TODO: implémenter la logique de rejet (rebond sur la frontière)
+    }
+}
+
+fn handle_ghost_update(
+    data: &[u8],
+    handoff_mgr: &mut HandoffManager,
+) {
+    if data.len() <= 1 {
+        return;
+    }
+
+    if let Ok(msg) = serde_json::from_slice::<GhostUpdate>(&data[1..]) {
+        info!("[INFO] GhostUpdate received for entity {}: ({}, {})",
+              msg.entity_id, msg.pos_x, msg.pos_y);
+
+        // Mettre à jour la position du ghost
+        if let Some(ghost) = handoff_mgr.ghost_entities.get_mut(&msg.entity_id.to_string()) {
+            ghost.pos_x = msg.pos_x;
+            ghost.pos_y = msg.pos_y;
+            ghost.vel_x = msg.vel_x;
+            ghost.vel_y = msg.vel_y;
+        }
+    }
+}
+
+fn handle_handoff_complete(
+    data: &[u8],
+    registry: &mut PlayerRegistry,
+    handoff_mgr: &mut HandoffManager,
+) {
+    if data.len() <= 1 {
+        return;
+    }
+
+    if let Ok(msg) = serde_json::from_slice::<HandoffComplete>(&data[1..]) {
+        info!("[INFO] HandoffComplete received for entity {}", msg.entity_id);
+
+        // Supprimer le ghost local et terminer le handoff
+        handoff_mgr.remove_ghost(&msg.entity_id.to_string());
+        handoff_mgr.complete_handoff(&msg.entity_id.to_string());
+    }
+}
+
+fn process_handoff_timeouts(
+    time: Res<Time>,
+    mut handoff_mgr: ResMut<HandoffManager>,
+) {
+    let mut expired = Vec::new();
+    for (entity_id, handoff) in handoff_mgr.pending.iter_mut() {
+        handoff.timer.tick(time.delta());
+        if handoff.timer.finished() {
+            expired.push(entity_id.clone());
+        }
+    }
+
+    for entity_id in expired {
+        handoff_mgr.complete_handoff(&entity_id);
+        warn!("[WARN] Handoff timeout for entity {}", entity_id);
     }
 }
