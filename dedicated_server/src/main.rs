@@ -4,7 +4,7 @@ use bevy::app::ScheduleRunnerPlugin;
 use std::time::Duration;
 use game_sockets::{GamePeer, GameNetworkEvent, GameStreamReliability, GameConnection, GameStream};
 use game_sockets::protocols::QuicBackend;
-use crate::resources::{ServerConfig, PlayerRegistry, HeartbeatTimer, Orchestrator, HandoffManager};
+use crate::resources::{ServerConfig, PlayerRegistry, HeartbeatTimer, Orchestrator, SpatialService, HandoffManager};
 use shared::{Heartbeat, EntityState, HandoffRequest, HandoffAccept, HandoffReject, HandoffComplete, GhostUpdate};
 use bytes::Bytes;
 
@@ -25,9 +25,10 @@ fn main() {
         .insert_resource(ServerConfig::from_env())
         .init_resource::<PlayerRegistry>()
         .init_resource::<Orchestrator>()
+        .init_resource::<SpatialService>()
         .init_resource::<HandoffManager>()
         .init_resource::<HeartbeatTimer>()
-        .add_systems(Startup, (setup_networking, connect_to_orchestrator).chain())
+        .add_systems(Startup, (setup_networking, connect_to_orchestrator, connect_to_spatial_service).chain())
         .add_systems(Update, (
             handle_network_events,
             send_heartbeat,
@@ -53,10 +54,22 @@ fn connect_to_orchestrator(peer: ResMut<GamePeerResource>, config: Res<ServerCon
     }
 }
 
+fn connect_to_spatial_service(peer: ResMut<GamePeerResource>) {
+    let addr = std::env::var("SPATIAL_ADDR").unwrap_or("127.0.0.1:9001".to_string());
+    let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
+    let port: u16 = parts[0].parse().unwrap_or(9001);
+    let host = parts[1];
+    info!("[INFO] Connecting to spatial service at {}", addr);
+    if let Err(e) = peer.0.connect(host, port) {
+        error!("[ERROR] Failed to connect to spatial service: {}", e);
+    }
+}
+
 fn handle_network_events(
     mut peer: ResMut<GamePeerResource>,
     mut registry: ResMut<PlayerRegistry>,
     mut orchestrator: ResMut<Orchestrator>,
+    mut spatial: ResMut<SpatialService>,
     mut handoff_mgr: ResMut<HandoffManager>,
     config: Res<ServerConfig>,
 ) {
@@ -66,6 +79,9 @@ fn handle_network_events(
                 if orchestrator.connection.is_none() {
                     info!("[INFO] Orchestrator connected: {:?}", conn);
                     orchestrator.connection = Some(conn);
+                } else if spatial.connection.is_none() {
+                    info!("[INFO] Spatial service connected: {:?}", conn);
+                    spatial.connection = Some(conn);
                 } else {
                     info!("[INFO] Peer connected: {:?}", conn);
                 }
@@ -74,19 +90,37 @@ fn handle_network_events(
                 if Some(conn) == orchestrator.connection {
                     orchestrator.connection = None;
                     warn!("[WARN] Orchestrator disconnected.");
+                } else if Some(conn) == spatial.connection {
+                    spatial.connection = None;
+                    warn!("[WARN] Spatial service disconnected.");
                 } else {
                     info!("[INFO] Peer disconnected: {:?}", conn);
                     registry.remove_player(&conn);
                 }
             }
             GameNetworkEvent::Message { connection, stream, data } => {
+                if data.is_empty() { continue; }
+
+                // Binary protocol messages come first.
+                match data[0] {
+                    0x11 => {
+                        handle_crossing_alert(&data, &registry, &mut handoff_mgr);
+                        continue;
+                    }
+                    0x20 => { handle_handoff_request(&data, connection, &mut registry, &mut handoff_mgr, &mut peer.0); continue; }
+                    0x21 => { handle_handoff_accept(&data, &mut registry, &mut handoff_mgr); continue; }
+                    0x22 => { handle_handoff_reject(&data, &mut registry, &mut handoff_mgr); continue; }
+                    0x23 => { handle_ghost_update(&data, &mut handoff_mgr); continue; }
+                    0x24 => { handle_handoff_complete(&data, &mut registry, &mut handoff_mgr); continue; }
+                    _ => {}
+                }
+
                 let message = String::from_utf8_lossy(&data);
                 info!("[DEBUG] Received message from {:?} on stream {:?}: {}", connection, stream, message);
 
                 if let Some(username) = message.strip_prefix("JOIN ") {
                     handle_join(username, connection, stream, &mut peer.0, &mut registry, config.max_players);
                 } else if message.starts_with("UPDATE_POS ") {
-                    // Format: "UPDATE_POS x y vx vy"
                     let parts: Vec<&str> = message.strip_prefix("UPDATE_POS ").unwrap_or("").split_whitespace().collect();
                     if parts.len() >= 4 {
                         if let (Ok(x), Ok(y), Ok(vx), Ok(vy)) = (
@@ -97,16 +131,8 @@ fn handle_network_events(
                         ) {
                             registry.update_position(&connection, x, y);
                             registry.update_velocity(&connection, vx, vy);
+                            send_position_update(&peer.0, &spatial, &registry, &connection, &config, x, y);
                         }
-                    }
-                } else if data.len() > 0 {
-                    match data[0] {
-                        0x20 => handle_handoff_request(&data, connection, &mut registry, &mut handoff_mgr, &mut peer.0),
-                        0x21 => handle_handoff_accept(&data, &mut registry, &mut handoff_mgr),
-                        0x22 => handle_handoff_reject(&data, &mut registry, &mut handoff_mgr),
-                        0x23 => handle_ghost_update(&data, &mut handoff_mgr),
-                        0x24 => handle_handoff_complete(&data, &mut registry, &mut handoff_mgr),
-                        _ => {}
                     }
                 }
             }
@@ -140,6 +166,67 @@ fn handle_join(
         let response = "FULL";
         let _ = peer.send(&connection, &stream, Bytes::from(response));
     }
+}
+
+fn send_position_update(
+    peer: &GamePeer,
+    spatial: &SpatialService,
+    registry: &PlayerRegistry,
+    conn: &GameConnection,
+    config: &ServerConfig,
+    x: f32,
+    y: f32,
+) {
+    let spatial_conn = match spatial.connection {
+        Some(c) => c,
+        None => return,
+    };
+    let player = match registry.players.get(conn) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Parse the player's UUID string to raw bytes for the binary protocol.
+    let uuid: uuid::Uuid = match player.id.parse() {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    // TAG(1) + shard_id(4) + client_uuid(16) + x(4) + y(4)
+    let mut buf = Vec::with_capacity(29);
+    buf.push(0x10u8);
+    buf.extend_from_slice(&config.shard_id.to_le_bytes());
+    buf.extend_from_slice(uuid.as_bytes());
+    buf.extend_from_slice(&x.to_le_bytes());
+    buf.extend_from_slice(&y.to_le_bytes());
+
+    let stream = GameStream::new(0, GameStreamReliability::Unreliable);
+    let _ = peer.send(&spatial_conn, &stream, Bytes::from(buf));
+}
+
+fn handle_crossing_alert(
+    data: &[u8],
+    registry: &PlayerRegistry,
+    handoff_mgr: &mut HandoffManager,
+) {
+    // TAG(1) + client_uuid(16) + dest_shard_id(4) = 21 bytes
+    if data.len() < 21 { return; }
+
+    let client_uuid = &data[1..17];
+    let dest_shard_id = u32::from_le_bytes(data[17..21].try_into().unwrap());
+
+    // Find the player with this UUID.
+    let uuid_str = uuid::Uuid::from_bytes(client_uuid.try_into().unwrap()).to_string();
+    let player = match registry.get_player_by_id(&uuid_str) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Skip if a handoff is already in progress for this entity.
+    if handoff_mgr.is_handoff_in_progress(&player.id) { return; }
+
+    info!("[INFO] CrossingAlert: entity {} should hand off to shard {}", player.id, dest_shard_id);
+    // Actual HandoffRequest to the destination shard is Part 3 (inter-shard connections).
 }
 
 fn send_heartbeat(
