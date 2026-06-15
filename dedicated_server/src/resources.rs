@@ -29,6 +29,7 @@ pub struct PlayerInfo {
 #[derive(Resource, Debug, Clone)]
 pub struct ServerConfig {
     pub id: String,
+    pub shard_id: u32,
     pub port: u16,
     pub zone: String,
     pub max_players: usize,
@@ -55,8 +56,14 @@ impl ServerConfig {
             .parse::<SocketAddr>()
             .expect("ORCHESTRATOR_ADDR doit être une adresse valide");
 
+        let shard_id = std::env::var("DS_SHARD_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u32>()
+            .unwrap_or(0);
+
         Self {
             id: Uuid::new_v4().to_string(),
+            shard_id,
             port,
             zone,
             max_players,
@@ -135,6 +142,11 @@ impl PlayerRegistry {
 
 #[derive(Resource, Default)]
 pub struct Orchestrator {
+    pub connection: Option<GameConnection>,
+}
+
+#[derive(Resource, Default)]
+pub struct SpatialService {
     pub connection: Option<GameConnection>,
 }
 
