@@ -244,3 +244,56 @@ mod tests {
         assert_eq!(t.shards_near([250.0, 10.0], 50.0), vec![0]);
     }
 }
+
+// Property-based tests: instead of picking positions by hand, check invariants
+// that must hold for *every* point in the world. Catches edge cases the
+// example tests above might miss (e.g. near boundaries with arbitrary margins).
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Interior positions, kept strictly inside [0,1000) so shard_for is defined.
+    fn in_bounds() -> impl Strategy<Value = [f32; 2]> {
+        (0.0f32..999.0, 0.0f32..999.0).prop_map(|(x, y)| [x, y])
+    }
+
+    proptest! {
+        // Any in-bounds point belongs to exactly one of the four shards.
+        #[test]
+        fn shard_for_is_defined_inside_world(pos in in_bounds()) {
+            let id = build_default().shard_for(pos);
+            prop_assert!(matches!(id, Some(0..=3)));
+        }
+
+        // The owning shard is always part of its own neighbourhood.
+        #[test]
+        fn owning_shard_is_always_near(pos in in_bounds(), margin in 0.0f32..500.0) {
+            let t = build_default();
+            let owner = t.shard_for(pos).unwrap();
+            prop_assert!(t.shards_near(pos, margin).contains(&owner));
+        }
+
+        // A wider margin can only add shards, never remove them.
+        #[test]
+        fn shards_near_is_monotonic_in_margin(pos in in_bounds(), m in 0.0f32..400.0) {
+            let t = build_default();
+            let small = t.shards_near(pos, m);
+            let large = t.shards_near(pos, m + 50.0);
+            for s in &small {
+                prop_assert!(large.contains(s));
+            }
+        }
+
+        // Results are always sorted, deduped and within the valid shard range.
+        #[test]
+        fn shards_near_output_is_well_formed(pos in in_bounds(), margin in 0.0f32..600.0) {
+            let near = build_default().shards_near(pos, margin);
+            let mut sorted = near.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            prop_assert_eq!(near.clone(), sorted);
+            prop_assert!(near.iter().all(|&s| s <= 3));
+        }
+    }
+}

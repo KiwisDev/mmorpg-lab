@@ -1,6 +1,6 @@
 mod quad_tree;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use bytes::{BytesMut, BufMut};
 use game_sockets::{GameConnection, GameNetworkEvent, GamePeer, GameStream, GameStreamReliability};
@@ -10,62 +10,116 @@ const TAG_SUBSCRIBE: u8 = 0x01;
 const TAG_UNSUBSCRIBE: u8 = 0x02;
 const TAG_POSITION_UPDATE: u8 = 0x10;
 const TAG_CROSSING_ALERT: u8 = 0x11;
+
+// Authority: how close to a neighbour shard triggers a handoff pre-warm.
 const BOUNDARY_MARGIN: f32 = 50.0;
 
-// Actions returned by compute_position_update — no network, fully testable.
+// Visibility (AOI), half-side in world units. A shard is 500 wide:
+//   near (20 Hz) = shards within AOI_NEAR of the player → "shard:N"
+//   far  (5 Hz)  = extra shards within AOI_FAR (but not near) → "shard:N:far"
+const AOI_NEAR: f32 = 200.0;
+const AOI_FAR: f32 = 350.0;
+
+// Subscription changes produced by compute_aoi_subscriptions — no network, testable.
 #[derive(Debug, PartialEq)]
-enum SpatialAction {
-    Subscribe([u8; 16], u32),
-    Unsubscribe([u8; 16], u32),
-    CrossingAlert([u8; 16], u32), // dest_shard_id
+enum SubAction {
+    Subscribe([u8; 16], String),   // (client_uuid, topic)
+    Unsubscribe([u8; 16], String),
 }
 
 struct SpatialState {
-    client_shard: HashMap<[u8; 16], u32>,
+    // Authority shard per client (drives handoff crossing alerts).
+    client_home: HashMap<[u8; 16], u32>,
+    // Current AOI topics each client is subscribed to (drives the diff).
+    client_subs: HashMap<[u8; 16], HashSet<String>>,
     broker_conn: Option<GameConnection>,
 }
 
 impl SpatialState {
     fn new() -> Self {
-        Self { client_shard: HashMap::new(), broker_conn: None }
+        Self {
+            client_home: HashMap::new(),
+            client_subs: HashMap::new(),
+            broker_conn: None,
+        }
     }
 }
 
-// Pure logic: computes subscription changes and crossing alerts for a position update.
-// Mutates client_shard when the entity moves to a new shard.
-// Suppresses CrossingAlert toward the shard the entity just came from.
-fn compute_position_update(
+// Authority side: returns the shards to alert for a possible handoff.
+// Updates client_home, and suppresses the alert toward the shard just left.
+fn compute_crossing_alerts(
     client_uuid: [u8; 16],
     x: f32,
     y: f32,
-    client_shard: &mut HashMap<[u8; 16], u32>,
+    client_home: &mut HashMap<[u8; 16], u32>,
     quad_tree: &quad_tree::QuadTree,
     margin: f32,
-) -> Vec<SpatialAction> {
-    let mut actions = Vec::new();
-
+) -> Vec<u32> {
     let new_shard = match quad_tree.shard_for([x, y]) {
         Some(id) => id,
-        None => return actions,
+        None => return Vec::new(),
     };
 
-    let old_shard = client_shard.get(&client_uuid).copied();
-
+    let old_shard = client_home.get(&client_uuid).copied();
     if old_shard != Some(new_shard) {
-        if let Some(old) = old_shard {
-            actions.push(SpatialAction::Unsubscribe(client_uuid, old));
-        }
-        actions.push(SpatialAction::Subscribe(client_uuid, new_shard));
-        client_shard.insert(client_uuid, new_shard);
+        client_home.insert(client_uuid, new_shard);
     }
 
-    // Don't alert toward the shard we just came from — we already left it.
+    let mut alerts = Vec::new();
     for dest in quad_tree.shards_near([x, y], margin) {
         if dest != new_shard && Some(dest) != old_shard {
-            actions.push(SpatialAction::CrossingAlert(client_uuid, dest));
+            alerts.push(dest);
+        }
+    }
+    alerts
+}
+
+// Visibility side: computes the desired AOI topic set and diffs it against the
+// client's current subscriptions. Returns the Unsubscribe/Subscribe changes and
+// updates client_subs. Output is sorted so it is deterministic (testable).
+fn compute_aoi_subscriptions(
+    client_uuid: [u8; 16],
+    x: f32,
+    y: f32,
+    client_subs: &mut HashMap<[u8; 16], HashSet<String>>,
+    quad_tree: &quad_tree::QuadTree,
+    near: f32,
+    far: f32,
+) -> Vec<SubAction> {
+    // Out of the world: keep whatever the client already sees.
+    if quad_tree.shard_for([x, y]).is_none() {
+        return Vec::new();
+    }
+
+    let near_shards = quad_tree.shards_near([x, y], near);
+    let far_shards = quad_tree.shards_near([x, y], far);
+
+    let mut desired: HashSet<String> = HashSet::new();
+    for s in &near_shards {
+        desired.insert(format!("shard:{}", s));
+    }
+    for s in &far_shards {
+        if !near_shards.contains(s) {
+            desired.insert(format!("shard:{}:far", s));
         }
     }
 
+    let current = client_subs.entry(client_uuid).or_default();
+
+    let mut to_unsub: Vec<String> = current.difference(&desired).cloned().collect();
+    let mut to_sub: Vec<String> = desired.difference(current).cloned().collect();
+    to_unsub.sort();
+    to_sub.sort();
+
+    *current = desired;
+
+    let mut actions = Vec::new();
+    for topic in to_unsub {
+        actions.push(SubAction::Unsubscribe(client_uuid, topic));
+    }
+    for topic in to_sub {
+        actions.push(SubAction::Subscribe(client_uuid, topic));
+    }
     actions
 }
 
@@ -142,28 +196,33 @@ fn handle_position_update(
     let x = f32::from_le_bytes(data[21..25].try_into().unwrap());
     let y = f32::from_le_bytes(data[25..29].try_into().unwrap());
 
-    let actions = compute_position_update(
-        client_uuid, x, y, &mut state.client_shard, quad_tree, BOUNDARY_MARGIN,
+    // Authority: alert neighbour shards so they can pre-warm a handoff.
+    let alerts = compute_crossing_alerts(
+        client_uuid, x, y, &mut state.client_home, quad_tree, BOUNDARY_MARGIN,
     );
+    for dest in alerts {
+        println!("CrossingAlert: client {:?} → dest shard:{}", &client_uuid[..4], dest);
+        let mut buf = BytesMut::with_capacity(21);
+        buf.put_u8(TAG_CROSSING_ALERT);
+        buf.put_slice(&client_uuid);
+        buf.put_u32_le(dest);
+        // Send back to the shard that owns this entity.
+        let _ = peer.send(&from, stream, buf.freeze());
+    }
 
-    for action in actions {
+    // Visibility: update the client's AOI subscriptions at the broker.
+    let subs = compute_aoi_subscriptions(
+        client_uuid, x, y, &mut state.client_subs, quad_tree, AOI_NEAR, AOI_FAR,
+    );
+    for action in subs {
         match action {
-            SpatialAction::Subscribe(uuid, sid) => {
-                println!("Client {:?}: subscribe to shard:{}", &uuid[..4], sid);
-                send_to_broker(state, peer, stream, TAG_SUBSCRIBE, &uuid, sid);
+            SubAction::Subscribe(uuid, topic) => {
+                println!("Client {:?}: subscribe to {}", &uuid[..4], topic);
+                send_to_broker(state, peer, stream, TAG_SUBSCRIBE, &uuid, &topic);
             }
-            SpatialAction::Unsubscribe(uuid, sid) => {
-                println!("Client {:?}: unsubscribe from shard:{}", &uuid[..4], sid);
-                send_to_broker(state, peer, stream, TAG_UNSUBSCRIBE, &uuid, sid);
-            }
-            SpatialAction::CrossingAlert(uuid, dest) => {
-                println!("CrossingAlert: client {:?} → dest shard:{}", &uuid[..4], dest);
-                let mut buf = BytesMut::with_capacity(21);
-                buf.put_u8(TAG_CROSSING_ALERT);
-                buf.put_slice(&uuid);
-                buf.put_u32_le(dest);
-                // Send back to the shard that owns this entity.
-                let _ = peer.send(&from, stream, buf.freeze());
+            SubAction::Unsubscribe(uuid, topic) => {
+                println!("Client {:?}: unsubscribe from {}", &uuid[..4], topic);
+                send_to_broker(state, peer, stream, TAG_UNSUBSCRIBE, &uuid, &topic);
             }
         }
     }
@@ -175,7 +234,7 @@ fn send_to_broker(
     stream: &GameStream,
     tag: u8,
     client_uuid: &[u8; 16],
-    shard_id: u32,
+    topic: &str,
 ) {
     let broker_conn = match state.broker_conn {
         Some(c) => c,
@@ -185,22 +244,20 @@ fn send_to_broker(
         }
     };
 
-    let topic = shard_id_to_topic(shard_id);
     let mut buf = BytesMut::with_capacity(1 + 16 + 32);
     buf.put_u8(tag);
     buf.put_slice(client_uuid);
-    buf.put_slice(&topic);
+    buf.put_slice(&topic_to_bytes(topic));
 
     let _ = peer.send(&broker_conn, stream, buf.freeze());
 }
 
-fn shard_id_to_topic(shard_id: u32) -> [u8; 32] {
-    let mut topic = [0u8; 32];
-    let label = format!("shard:{}", shard_id);
-    let bytes = label.as_bytes();
+fn topic_to_bytes(topic: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let bytes = topic.as_bytes();
     let len = bytes.len().min(32);
-    topic[..len].copy_from_slice(&bytes[..len]);
-    topic
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
 }
 
 fn parse_addr(addr: &str) -> (String, u16) {
@@ -228,198 +285,92 @@ mod tests {
         id
     }
 
-    fn run(map: &mut HashMap<[u8;16], u32>, u: [u8;16], x: f32, y: f32) -> Vec<SpatialAction> {
-        compute_position_update(u, x, y, map, &tree(), BOUNDARY_MARGIN)
+    // ── Crossing alerts (authority) ─────────────────────────────────────────────
+    // compute_crossing_alerts returns the destination shards to pre-warm.
+
+    fn cross(map: &mut HashMap<[u8; 16], u32>, u: [u8; 16], x: f32, y: f32) -> Vec<u32> {
+        compute_crossing_alerts(u, x, y, map, &tree(), BOUNDARY_MARGIN)
     }
 
-    // ── First entry ────────────────────────────────────────────────────────────
-
     #[test]
-    fn first_entry_subscribe_only() {
+    fn first_entry_deep_no_alert() {
         let mut map = HashMap::new();
         let u = uuid(1);
-        let a = run(&mut map, u, 250.0, 250.0);
-        assert_eq!(a, vec![SpatialAction::Subscribe(u, 0)]);
+        assert!(cross(&mut map, u, 250.0, 250.0).is_empty());
+        assert_eq!(map[&u], 0); // home recorded
+    }
+
+    #[test]
+    fn first_entry_near_boundary_alerts() {
+        let mut map = HashMap::new();
+        let u = uuid(2);
+        assert_eq!(cross(&mut map, u, 460.0, 250.0), vec![1]);
         assert_eq!(map[&u], 0);
     }
 
     #[test]
-    fn first_entry_near_boundary_also_alerts() {
-        // Player spawns 40 units from vertical boundary → Subscribe + CrossingAlert
-        let mut map = HashMap::new();
-        let u = uuid(2);
-        let a = run(&mut map, u, 460.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Subscribe(u, 0),
-            SpatialAction::CrossingAlert(u, 1),
-        ]);
-    }
-
-    // ── Stay in same shard ─────────────────────────────────────────────────────
-
-    #[test]
-    fn no_action_when_staying_in_shard() {
+    fn no_alert_when_staying_in_shard() {
         let mut map = HashMap::new();
         let u = uuid(3);
         map.insert(u, 0);
-        let a = run(&mut map, u, 300.0, 300.0);
-        assert!(a.is_empty());
+        assert!(cross(&mut map, u, 300.0, 300.0).is_empty());
     }
 
-    // ── Vertical boundary crossings ────────────────────────────────────────────
-
     #[test]
-    fn cross_vertical_left_to_right() {
+    fn cross_vertical_updates_home_no_alert_when_deep() {
         let mut map = HashMap::new();
         let u = uuid(4);
         map.insert(u, 0);
-        // Land deep in shard 1, far from any boundary → no alert
-        let a = run(&mut map, u, 700.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 1),
-        ]);
+        assert!(cross(&mut map, u, 700.0, 250.0).is_empty());
         assert_eq!(map[&u], 1);
     }
 
-    #[test]
-    fn cross_vertical_right_to_left() {
-        let mut map = HashMap::new();
-        let u = uuid(5);
-        map.insert(u, 1);
-        let a = run(&mut map, u, 250.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 1),
-            SpatialAction::Subscribe(u, 0),
-        ]);
-    }
-
-    // Exact boundary point x=500 belongs to the right shard (inclusive ≥).
+    // Exact boundary point x=500 belongs to the right shard; no alert back to shard 0.
     #[test]
     fn cross_on_exact_vertical_boundary_line() {
         let mut map = HashMap::new();
         let u = uuid(6);
         map.insert(u, 0);
-        let a = run(&mut map, u, 500.0, 250.0);
-        // x=500 → shard 1. No CrossingAlert toward shard 0 (old_shard suppressed).
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 1),
-        ]);
+        assert!(cross(&mut map, u, 500.0, 250.0).is_empty());
         assert_eq!(map[&u], 1);
     }
 
-    // ── Horizontal boundary crossings ──────────────────────────────────────────
-
     #[test]
-    fn cross_horizontal_top_to_bottom() {
+    fn cross_horizontal_updates_home() {
         let mut map = HashMap::new();
         let u = uuid(7);
         map.insert(u, 0);
-        let a = run(&mut map, u, 250.0, 700.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 2),
-        ]);
+        assert!(cross(&mut map, u, 250.0, 700.0).is_empty());
+        assert_eq!(map[&u], 2);
     }
 
     #[test]
-    fn cross_horizontal_bottom_to_top() {
-        let mut map = HashMap::new();
-        let u = uuid(8);
-        map.insert(u, 2);
-        let a = run(&mut map, u, 250.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 2),
-            SpatialAction::Subscribe(u, 0),
-        ]);
-    }
-
-    // ── Diagonal crossings ─────────────────────────────────────────────────────
-
-    #[test]
-    fn diagonal_jump_shard0_to_shard3() {
-        // Fast teleport: skips the alert window entirely
+    fn diagonal_jump_updates_home() {
         let mut map = HashMap::new();
         let u = uuid(9);
         map.insert(u, 0);
-        let a = run(&mut map, u, 750.0, 750.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 3),
-        ]);
+        assert!(cross(&mut map, u, 750.0, 750.0).is_empty());
+        assert_eq!(map[&u], 3);
     }
 
-    #[test]
-    fn diagonal_jump_shard1_to_shard2() {
-        let mut map = HashMap::new();
-        let u = uuid(10);
-        map.insert(u, 1);
-        let a = run(&mut map, u, 250.0, 750.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 1),
-            SpatialAction::Subscribe(u, 2),
-        ]);
-    }
-
-    // Step-by-step diagonal walk through the shared corner.
-    // This is the richest scenario: player crosses from 0→1→3.
+    // Step-by-step diagonal walk through the shared corner: 0→1→3.
     #[test]
     fn diagonal_step_by_step_through_corner() {
         let mut map = HashMap::new();
         let u = uuid(11);
         map.insert(u, 0);
 
-        // Step 1: approaching corner from shard 0 — all 3 neighbours are in range
-        let a = run(&mut map, u, 490.0, 490.0);
-        assert_eq!(a, vec![
-            SpatialAction::CrossingAlert(u, 1),
-            SpatialAction::CrossingAlert(u, 2),
-            SpatialAction::CrossingAlert(u, 3),
-        ]);
+        // Step 1: approaching corner from shard 0 — all 3 neighbours in range
+        assert_eq!(cross(&mut map, u, 490.0, 490.0), vec![1, 2, 3]);
         assert_eq!(map[&u], 0); // no crossing yet
 
-        // Step 2: cross into shard 1 (x>500), still near y=500 boundary
-        // No alert toward shard 0 (just came from it)
-        let a = run(&mut map, u, 510.0, 490.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 1),
-            SpatialAction::CrossingAlert(u, 2),
-            SpatialAction::CrossingAlert(u, 3),
-        ]);
+        // Step 2: cross into shard 1, still near corner — no alert toward shard 0
+        assert_eq!(cross(&mut map, u, 510.0, 490.0), vec![2, 3]);
         assert_eq!(map[&u], 1);
 
-        // Step 3: cross into shard 3 (y>500) — no alert toward shard 1 (just came from)
-        let a = run(&mut map, u, 510.0, 510.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 1),
-            SpatialAction::Subscribe(u, 3),
-            SpatialAction::CrossingAlert(u, 0),
-            SpatialAction::CrossingAlert(u, 2),
-        ]);
+        // Step 3: cross into shard 3 — no alert toward shard 1 (just left)
+        assert_eq!(cross(&mut map, u, 510.0, 510.0), vec![0, 2]);
         assert_eq!(map[&u], 3);
-    }
-
-    // ── Crossing alerts ────────────────────────────────────────────────────────
-
-    #[test]
-    fn alert_near_vertical_boundary() {
-        let mut map = HashMap::new();
-        let u = uuid(12);
-        map.insert(u, 0);
-        // x=460: 460+50=510 > 500 → shard 1 in margin
-        let a = run(&mut map, u, 460.0, 250.0);
-        assert_eq!(a, vec![SpatialAction::CrossingAlert(u, 1)]);
-    }
-
-    #[test]
-    fn alert_near_horizontal_boundary() {
-        let mut map = HashMap::new();
-        let u = uuid(13);
-        map.insert(u, 0);
-        let a = run(&mut map, u, 250.0, 460.0);
-        assert_eq!(a, vec![SpatialAction::CrossingAlert(u, 2)]);
     }
 
     #[test]
@@ -427,27 +378,7 @@ mod tests {
         let mut map = HashMap::new();
         let u = uuid(14);
         map.insert(u, 0);
-        // (490,490): all 4 shards within margin; alert for 1, 2, 3
-        let a = run(&mut map, u, 490.0, 490.0);
-        assert_eq!(a, vec![
-            SpatialAction::CrossingAlert(u, 1),
-            SpatialAction::CrossingAlert(u, 2),
-            SpatialAction::CrossingAlert(u, 3),
-        ]);
-    }
-
-    #[test]
-    fn alert_from_shard3_near_corner() {
-        let mut map = HashMap::new();
-        let u = uuid(15);
-        map.insert(u, 3);
-        // (510,510): mirror of above from shard 3's perspective
-        let a = run(&mut map, u, 510.0, 510.0);
-        assert_eq!(a, vec![
-            SpatialAction::CrossingAlert(u, 0),
-            SpatialAction::CrossingAlert(u, 1),
-            SpatialAction::CrossingAlert(u, 2),
-        ]);
+        assert_eq!(cross(&mut map, u, 490.0, 490.0), vec![1, 2, 3]);
     }
 
     #[test]
@@ -455,8 +386,7 @@ mod tests {
         let mut map = HashMap::new();
         let u = uuid(16);
         map.insert(u, 3);
-        let a = run(&mut map, u, 750.0, 750.0);
-        assert!(a.is_empty());
+        assert!(cross(&mut map, u, 750.0, 750.0).is_empty());
     }
 
     // Exactly at margin distance: strict < means no alert fires.
@@ -465,9 +395,7 @@ mod tests {
         let mut map = HashMap::new();
         let u = uuid(17);
         map.insert(u, 0);
-        // x=450: 450+50=500, shard 1 requires 500 < 500 → FALSE
-        let a = run(&mut map, u, 450.0, 250.0);
-        assert!(a.is_empty());
+        assert!(cross(&mut map, u, 450.0, 250.0).is_empty());
     }
 
     #[test]
@@ -475,9 +403,7 @@ mod tests {
         let mut map = HashMap::new();
         let u = uuid(18);
         map.insert(u, 0);
-        // x=451: 451+50=501 > 500 → alert
-        let a = run(&mut map, u, 451.0, 250.0);
-        assert_eq!(a, vec![SpatialAction::CrossingAlert(u, 1)]);
+        assert_eq!(cross(&mut map, u, 451.0, 250.0), vec![1]);
     }
 
     // After crossing, no spurious alert back toward the old shard.
@@ -486,91 +412,171 @@ mod tests {
         let mut map = HashMap::new();
         let u = uuid(19);
         map.insert(u, 0);
-        // x=510: just crossed into shard 1, still within margin of shard 0
-        let a = run(&mut map, u, 510.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 1),
-            // No CrossingAlert for shard 0 — we just left it
-        ]);
+        assert!(cross(&mut map, u, 510.0, 250.0).is_empty());
+        assert_eq!(map[&u], 1);
     }
 
-    // ── Out of bounds ──────────────────────────────────────────────────────────
-
     #[test]
-    fn out_of_bounds_no_action() {
+    fn out_of_bounds_no_alert_keeps_home() {
         let mut map = HashMap::new();
         let u = uuid(20);
         map.insert(u, 0);
-        let a = run(&mut map, u, -50.0, 250.0);
-        assert!(a.is_empty());
+        assert!(cross(&mut map, u, -50.0, 250.0).is_empty());
         assert_eq!(map[&u], 0); // unchanged
     }
 
     #[test]
-    fn out_of_bounds_new_player_no_subscribe() {
+    fn out_of_bounds_new_player_not_recorded() {
         let mut map = HashMap::new();
         let u = uuid(21);
-        let a = run(&mut map, u, 1500.0, 250.0);
-        assert!(a.is_empty());
+        assert!(cross(&mut map, u, 1500.0, 250.0).is_empty());
         assert!(!map.contains_key(&u));
     }
 
     #[test]
-    fn out_of_bounds_then_reenter_different_shard() {
-        let mut map = HashMap::new();
-        let u = uuid(22);
-        map.insert(u, 0);
-        // Leave world
-        run(&mut map, u, -100.0, 250.0);
-        assert_eq!(map[&u], 0); // still remembered
-        // Re-enter in shard 1
-        let a = run(&mut map, u, 700.0, 250.0);
-        assert_eq!(a, vec![
-            SpatialAction::Unsubscribe(u, 0),
-            SpatialAction::Subscribe(u, 1),
-        ]);
-    }
-
-    // ── Multiple players independent ───────────────────────────────────────────
-
-    #[test]
-    fn two_players_independent() {
+    fn two_players_independent_homes() {
         let mut map = HashMap::new();
         let a = uuid(30);
         let b = uuid(31);
-
-        run(&mut map, a, 250.0, 250.0); // a → shard 0
-        run(&mut map, b, 750.0, 750.0); // b → shard 3
-
-        // A moves to shard 1
-        let actions = run(&mut map, a, 700.0, 250.0);
-        assert_eq!(actions, vec![
-            SpatialAction::Unsubscribe(a, 0),
-            SpatialAction::Subscribe(a, 1),
-        ]);
+        cross(&mut map, a, 250.0, 250.0); // a → shard 0
+        cross(&mut map, b, 750.0, 750.0); // b → shard 3
+        cross(&mut map, a, 700.0, 250.0); // a → shard 1
+        assert_eq!(map[&a], 1);
         assert_eq!(map[&b], 3); // B unaffected
     }
 
-    // ── World edge and corner ──────────────────────────────────────────────────
+    // ── AOI subscriptions (visibility) ──────────────────────────────────────────
+    // compute_aoi_subscriptions returns the Unsubscribe/Subscribe diff (topics).
 
+    fn aoi(subs: &mut HashMap<[u8; 16], HashSet<String>>, u: [u8; 16], x: f32, y: f32) -> Vec<SubAction> {
+        compute_aoi_subscriptions(u, x, y, subs, &tree(), AOI_NEAR, AOI_FAR)
+    }
+
+    fn sub(u: [u8; 16], t: &str) -> SubAction { SubAction::Subscribe(u, t.to_string()) }
+    fn unsub(u: [u8; 16], t: &str) -> SubAction { SubAction::Unsubscribe(u, t.to_string()) }
+
+    // At a shard's centre: own shard near (20 Hz), the three others far (5 Hz).
     #[test]
-    fn player_at_world_origin() {
-        let mut map = HashMap::new();
-        let u = uuid(32);
-        // (0,0) is shard 0, no neighbours to the left or above
-        let a = run(&mut map, u, 0.0, 0.0);
-        assert_eq!(a, vec![SpatialAction::Subscribe(u, 0)]);
+    fn aoi_center_self_near_neighbours_far() {
+        let mut subs = HashMap::new();
+        let u = uuid(40);
+        let a = aoi(&mut subs, u, 250.0, 250.0);
+        assert_eq!(a, vec![
+            sub(u, "shard:0"),
+            sub(u, "shard:1:far"),
+            sub(u, "shard:2:far"),
+            sub(u, "shard:3:far"),
+        ]);
+    }
+
+    // Re-computing the same position yields no change.
+    #[test]
+    fn aoi_no_change_when_stationary() {
+        let mut subs = HashMap::new();
+        let u = uuid(41);
+        aoi(&mut subs, u, 250.0, 250.0);
+        assert!(aoi(&mut subs, u, 250.0, 250.0).is_empty());
+    }
+
+    // Approaching the x=500 boundary promotes shard 1 from far to near.
+    #[test]
+    fn aoi_approach_boundary_promotes_far_to_near() {
+        let mut subs = HashMap::new();
+        let u = uuid(42);
+        aoi(&mut subs, u, 250.0, 250.0); // center
+        let a = aoi(&mut subs, u, 350.0, 250.0);
+        assert_eq!(a, vec![
+            unsub(u, "shard:1:far"),
+            sub(u, "shard:1"),
+        ]);
+    }
+
+    // Walking into a world corner drops the far neighbours entirely.
+    #[test]
+    fn aoi_corner_drops_far_neighbours() {
+        let mut subs = HashMap::new();
+        let u = uuid(43);
+        aoi(&mut subs, u, 250.0, 250.0); // center: 0 near, 1/2/3 far
+        let a = aoi(&mut subs, u, 50.0, 50.0);
+        assert_eq!(a, vec![
+            unsub(u, "shard:1:far"),
+            unsub(u, "shard:2:far"),
+            unsub(u, "shard:3:far"),
+        ]);
+    }
+
+    // Out of bounds keeps the current subscriptions untouched.
+    #[test]
+    fn aoi_out_of_bounds_keeps_subs() {
+        let mut subs = HashMap::new();
+        let u = uuid(44);
+        aoi(&mut subs, u, 250.0, 250.0);
+        let before = subs[&u].clone();
+        let a = aoi(&mut subs, u, -50.0, 250.0);
+        assert!(a.is_empty());
+        assert_eq!(subs[&u], before);
     }
 
     #[test]
     fn topic_encoding() {
-        let t = shard_id_to_topic(0);
+        let t = topic_to_bytes("shard:0");
         assert_eq!(&t[..7], b"shard:0");
         assert_eq!(t[7], 0);
 
-        let t = shard_id_to_topic(3);
-        assert_eq!(&t[..7], b"shard:3");
-        assert_eq!(t[7], 0);
+        let t = topic_to_bytes("shard:3:far");
+        assert_eq!(&t[..11], b"shard:3:far");
+        assert_eq!(t[11], 0);
+    }
+}
+
+// Property-based invariants for the AOI logic over random in-bounds positions.
+#[cfg(test)]
+mod aoi_prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn in_bounds() -> impl Strategy<Value = [f32; 2]> {
+        (0.0f32..999.0, 0.0f32..999.0).prop_map(|(x, y)| [x, y])
+    }
+
+    proptest! {
+        // The owning shard's near topic is always part of the AOI.
+        #[test]
+        fn owner_topic_always_subscribed(pos in in_bounds()) {
+            let tree = quad_tree::build_default();
+            let mut subs = HashMap::new();
+            let u = [7u8; 16];
+            compute_aoi_subscriptions(u, pos[0], pos[1], &mut subs, &tree, AOI_NEAR, AOI_FAR);
+            let owner = tree.shard_for(pos).unwrap();
+            let owner_topic = format!("shard:{}", owner);
+            prop_assert!(subs[&u].contains(&owner_topic));
+        }
+
+        // A shard is never both near and far at once.
+        #[test]
+        fn near_and_far_are_disjoint(pos in in_bounds()) {
+            let tree = quad_tree::build_default();
+            let mut subs = HashMap::new();
+            let u = [8u8; 16];
+            compute_aoi_subscriptions(u, pos[0], pos[1], &mut subs, &tree, AOI_NEAR, AOI_FAR);
+            for s in 0..4 {
+                let near_topic = format!("shard:{}", s);
+                let far_topic = format!("shard:{}:far", s);
+                let near = subs[&u].contains(&near_topic);
+                let far = subs[&u].contains(&far_topic);
+                prop_assert!(!(near && far));
+            }
+        }
+
+        // Recomputing the same position produces no further changes (stable).
+        #[test]
+        fn aoi_is_idempotent(pos in in_bounds()) {
+            let tree = quad_tree::build_default();
+            let mut subs = HashMap::new();
+            let u = [9u8; 16];
+            compute_aoi_subscriptions(u, pos[0], pos[1], &mut subs, &tree, AOI_NEAR, AOI_FAR);
+            let second = compute_aoi_subscriptions(u, pos[0], pos[1], &mut subs, &tree, AOI_NEAR, AOI_FAR);
+            prop_assert!(second.is_empty());
+        }
     }
 }
