@@ -1,6 +1,6 @@
 ﻿use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use uuid::Uuid;
 use game_sockets::GameConnection;
@@ -44,7 +44,12 @@ impl ServerConfig {
             .parse::<u16>()
             .expect("DS_PORT doit être un numéro de port valide");
 
-        let zone = std::env::var("DS_ZONE").unwrap_or_else(|_| "zone_A".to_string());
+        let shard_id = std::env::var("DS_SHARD_ID")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<u32>()
+            .unwrap_or(0);
+
+        let zone = std::env::var("DS_ZONE").unwrap_or_else(|_| format!("zone_{}", shard_id));
 
         let max_players = std::env::var("DS_MAX_PLAYERS")
             .unwrap_or_else(|_| "10".to_string())
@@ -55,11 +60,6 @@ impl ServerConfig {
             .unwrap_or_else(|_| "127.0.0.1:9000".to_string())
             .parse::<SocketAddr>()
             .expect("ORCHESTRATOR_ADDR doit être une adresse valide");
-
-        let shard_id = std::env::var("DS_SHARD_ID")
-            .unwrap_or_else(|_| "0".to_string())
-            .parse::<u32>()
-            .unwrap_or(0);
 
         Self {
             id: Uuid::new_v4().to_string(),
@@ -97,6 +97,52 @@ impl PlayerRegistry {
         };
         self.players.insert(conn, player.clone());
         player
+    }
+
+    pub fn add_player_with_uuid(&mut self, uuid: [u8; 16], username: String, spawn_x: f32, spawn_y: f32) -> PlayerInfo {
+        let fake_conn = GameConnection { connection_id: Uuid::from_bytes(uuid) };
+        let player = PlayerInfo {
+            id: Uuid::from_bytes(uuid).to_string(),
+            username,
+            pos_x: spawn_x,
+            pos_y: spawn_y,
+            vel_x: 0.0,
+            vel_y: 0.0,
+            state: EntityState::Owned,
+            owner_shard_id: None,
+            conn: None,
+        };
+        self.players.insert(fake_conn, player.clone());
+        player
+    }
+
+    pub fn remove_player_by_uuid(&mut self, uuid: [u8; 16]) -> Option<PlayerInfo> {
+        let fake_conn = GameConnection { connection_id: Uuid::from_bytes(uuid) };
+        self.players.remove(&fake_conn)
+    }
+
+    pub fn set_state_by_uuid(&mut self, uuid: [u8; 16], state: EntityState) {
+        let fake_conn = GameConnection { connection_id: Uuid::from_bytes(uuid) };
+        if let Some(player) = self.players.get_mut(&fake_conn) {
+            player.state = state;
+        }
+    }
+
+    // Insert a player (e.g. a former ghost) as the authoritative Owned copy.
+    pub fn promote_to_owned(&mut self, mut player: PlayerInfo) {
+        if let Ok(u) = Uuid::parse_str(&player.id) {
+            player.state = EntityState::Owned;
+            player.conn = None;
+            self.players.insert(GameConnection { connection_id: u }, player);
+        }
+    }
+
+    pub fn update_velocity_by_uuid(&mut self, uuid: [u8; 16], vx: f32, vy: f32) {
+        let fake_conn = GameConnection { connection_id: Uuid::from_bytes(uuid) };
+        if let Some(player) = self.players.get_mut(&fake_conn) {
+            player.vel_x = vx;
+            player.vel_y = vy;
+        }
     }
 
     pub fn remove_player(&mut self, conn: &GameConnection) -> Option<PlayerInfo> {
@@ -150,8 +196,51 @@ pub struct SpatialService {
     pub connection: Option<GameConnection>,
 }
 
+#[derive(Resource, Default)]
+pub struct BrokerConnection {
+    pub connection: Option<GameConnection>,
+}
+
+// Identifies what each outgoing QUIC connection is for.
+// Startup systems push in order; handle_network_events pops in order.
+#[derive(Debug, Clone, Copy)]
+pub enum PendingConnType { Orchestrator, Spatial, Broker }
+
+#[derive(Resource, Default)]
+pub struct PendingConnections(pub VecDeque<PendingConnType>);
+
 #[derive(Resource)]
 pub struct HeartbeatTimer(pub Timer);
+
+#[derive(Resource)]
+pub struct GameStateTimer(pub Timer);
+
+impl Default for GameStateTimer {
+    fn default() -> Self {
+        // Broadcast game state at 20fps
+        GameStateTimer(Timer::from_seconds(0.05, TimerMode::Repeating))
+    }
+}
+
+#[derive(Resource)]
+pub struct SpatialUpdateTimer(pub Timer);
+
+impl Default for SpatialUpdateTimer {
+    fn default() -> Self {
+        // Report owned-entity positions to the spatial service at 10Hz
+        SpatialUpdateTimer(Timer::from_seconds(0.1, TimerMode::Repeating))
+    }
+}
+
+#[derive(Resource)]
+pub struct FarPublishTimer(pub Timer);
+
+impl Default for FarPublishTimer {
+    fn default() -> Self {
+        // Low-frequency game-state publish for the AOI "far" ring (5Hz)
+        FarPublishTimer(Timer::from_seconds(0.2, TimerMode::Repeating))
+    }
+}
 
 impl Default for HeartbeatTimer {
     fn default() -> Self {
@@ -159,13 +248,14 @@ impl Default for HeartbeatTimer {
     }
 }
 
-/// Suivi d'un transfert d'autorité en cours
+/// Suivi d'un transfert d'autorité en cours (côté shard source)
 #[derive(Debug, Clone)]
 pub struct HandoffInProgress {
     pub entity_id: String,
     pub source_shard_id: u32,
     pub dest_shard_id: u32,
-    pub entity_state: Vec<u8>,
+    /// True once the destination shard sent HandoffAccept — GhostUpdates can flow.
+    pub accepted: bool,
     pub timer: Timer, // Timeout pour le handoff
 }
 
@@ -187,13 +277,12 @@ impl HandoffManager {
         entity_id: String,
         source_shard_id: u32,
         dest_shard_id: u32,
-        entity_state: Vec<u8>,
     ) {
         let handoff = HandoffInProgress {
             entity_id: entity_id.clone(),
             source_shard_id,
             dest_shard_id,
-            entity_state,
+            accepted: false,
             timer: Timer::from_seconds(5.0, TimerMode::Once),
         };
         self.pending.insert(entity_id, handoff);

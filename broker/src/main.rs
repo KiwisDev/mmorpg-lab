@@ -3,7 +3,7 @@ use std::sync::Arc;
 use game_sockets::{GameNetworkEvent, GamePeer, GameConnection, GameStream, GameStreamReliability};
 use game_sockets::protocols::QuicBackend;
 use tokio::sync::RwLock;
-use bytes::{Bytes, BytesMut, Buf, BufMut};
+use bytes::{BytesMut, Buf, BufMut};
 use uuid::Uuid;
 
 const TAG_SUBSCRIBE: u8 = 0x01;
@@ -11,6 +11,7 @@ const TAG_UNSUBSCRIBE: u8 = 0x02;
 const TAG_PUBLISH: u8 = 0x03;
 const TAG_BROADCAST: u8 = 0x04;
 const TAG_CLIENT_INPUT: u8 = 0x05;
+const TAG_ROUTE_TO_SHARD: u8 = 0x06;
 
 type Topic = [u8; 32];
 type ClientId = Uuid;
@@ -22,10 +23,14 @@ pub struct BrokerState {
     // ClientId -> Set of Topics they are subscribed to (for routing inputs)
     client_topics: HashMap<ClientId, HashSet<Topic>>,
     // Topic -> GameConnection (which Shard is authoritative/registered for this topic)
-    shards: HashMap<Topic, GameConnection>
+    shards: HashMap<Topic, GameConnection>,
+    // ClientId -> actual QUIC GameConnection (transport assigns connection_id, not the UUID)
+    client_connections: HashMap<ClientId, GameConnection>,
 }
 
 impl BrokerState {
+    // Subscribe is issued by the spatial service, so it must NOT touch
+    // client_connections — that mapping is owned by ClientInput (the client itself).
     pub fn subscribe(&mut self, topic: Topic, client_id: ClientId) {
         self.subscriptions.entry(topic).or_default().insert(client_id);
         self.client_topics.entry(client_id).or_default().insert(topic);
@@ -42,6 +47,7 @@ impl BrokerState {
             topics.remove(&topic);
             if topics.is_empty() {
                 self.client_topics.remove(&client_id);
+                self.client_connections.remove(&client_id);
             }
         }
     }
@@ -80,10 +86,44 @@ impl PubSubBroker {
                     }
                     GameNetworkEvent::Disconnected(connection) => {
                         println!("Disconnected: {}", connection.connection_id);
+                        let mut state = self.state.write().await;
+
+                        // Find which client owned this connection (if any).
+                        let client_id = state.client_connections.iter()
+                            .find(|(_, conn)| **conn == connection)
+                            .map(|(id, _)| *id);
+
+                        if let Some(client_id) = client_id {
+                            if let Some(topics) = state.client_topics.remove(&client_id) {
+                                // Tell every shard this client was on that it left.
+                                let mut input = [0u8; 16];
+                                input[0] = 0x03; // LEAVE
+                                let mut leave = BytesMut::with_capacity(1 + 16 + 16);
+                                leave.put_u8(TAG_CLIENT_INPUT);
+                                leave.put_slice(client_id.as_bytes());
+                                leave.put_slice(&input);
+                                let leave_bytes = leave.freeze();
+
+                                let socket = self.socket.lock().await;
+                                for topic in &topics {
+                                    if let Some(subs) = state.subscriptions.get_mut(topic) {
+                                        subs.remove(&client_id);
+                                        if subs.is_empty() {
+                                            state.subscriptions.remove(topic);
+                                        }
+                                    }
+                                    if let Some(shard_conn) = state.shards.get(topic) {
+                                        let _ = socket.send(shard_conn, &default_stream, leave_bytes.clone());
+                                    }
+                                }
+                            }
+                            state.client_connections.remove(&client_id);
+                            println!("Cleaned up client {} after disconnect", client_id);
+                        }
                     }
                     GameNetworkEvent::Message { mut data, connection, .. } => {
                         if data.is_empty() { continue; }
-                        
+
                         let tag = data.get_u8();
                         match tag {
                             TAG_SUBSCRIBE => {
@@ -126,7 +166,7 @@ impl PubSubBroker {
                                         let mut state = self.state.write().await;
                                         // Register this connection as the shard for this topic
                                         state.shards.insert(topic, connection);
-                                        
+
                                         // Send Broadcast to all subscribed clients
                                         if let Some(subscribers) = state.subscriptions.get(&topic) {
                                             // Prepare broadcast packet
@@ -135,11 +175,12 @@ impl PubSubBroker {
                                             out_buf.put_u16_le(payload_len);
                                             out_buf.put(payload);
                                             let out_bytes = out_buf.freeze();
-                                            
+
                                             let socket = self.socket.lock().await;
                                             for &sub_id in subscribers {
-                                                let client_conn = GameConnection { connection_id: sub_id };
-                                                let _ = socket.send(&client_conn, &default_stream, out_bytes.clone());
+                                                if let Some(client_conn) = state.client_connections.get(&sub_id) {
+                                                    let _ = socket.send(client_conn, &default_stream, out_bytes.clone());
+                                                }
                                             }
                                         }
                                     }
@@ -153,9 +194,12 @@ impl PubSubBroker {
                                     
                                     let mut input = [0u8; 16];
                                     data.copy_to_slice(&mut input);
-                                    
-                                    let state = self.state.read().await;
-                                    
+
+                                    let mut state = self.state.write().await;
+                                    // The client is the only sender of ClientInput: record its real
+                                    // connection here so Broadcasts reach it (Subscribes come from spatial).
+                                    state.client_connections.insert(client_id, connection);
+
                                     // Forward ClientInput to all shards the client is subscribed to
                                     if let Some(topics) = state.client_topics.get(&client_id) {
                                         let mut out_buf = BytesMut::with_capacity(1 + 16 + 16);
@@ -163,13 +207,30 @@ impl PubSubBroker {
                                         out_buf.put_slice(&client_id_bytes);
                                         out_buf.put_slice(&input);
                                         let out_bytes = out_buf.freeze();
-                                        
+
                                         let socket = self.socket.lock().await;
                                         for topic in topics {
                                             if let Some(shard_conn) = state.shards.get(topic) {
                                                 let _ = socket.send(shard_conn, &default_stream, out_bytes.clone());
                                             }
                                         }
+                                    }
+                                }
+                            }
+                            TAG_ROUTE_TO_SHARD => {
+                                // Inter-shard message: dest_topic[32] + inner_payload.
+                                // Forward the inner payload verbatim to the shard owning that topic.
+                                if data.remaining() >= 32 {
+                                    let mut topic = [0u8; 32];
+                                    data.copy_to_slice(&mut topic);
+                                    let inner = data.copy_to_bytes(data.remaining());
+
+                                    let state = self.state.read().await;
+                                    if let Some(shard_conn) = state.shards.get(&topic) {
+                                        let socket = self.socket.lock().await;
+                                        let _ = socket.send(shard_conn, &default_stream, inner);
+                                    } else {
+                                        println!("RouteToShard: no shard registered for topic {:?}", &topic[..8]);
                                     }
                                 }
                             }
@@ -190,8 +251,12 @@ impl PubSubBroker {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    println!("Starting Broker...");
-    let broker = PubSubBroker::new("0.0.0.0", 9000).await?;
+    let port: u16 = std::env::var("BROKER_PORT")
+        .unwrap_or("9010".to_string())
+        .parse()
+        .expect("BROKER_PORT must be a valid port number");
+    println!("Starting Broker on port {}...", port);
+    let broker = PubSubBroker::new("0.0.0.0", port).await?;
     broker.run().await?;
     Ok(())
 }

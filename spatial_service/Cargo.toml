@@ -7,3 +7,6 @@ edition = "2024"
 game_sockets.workspace = true
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
+
+[dev-dependencies]
+proptest = "1"

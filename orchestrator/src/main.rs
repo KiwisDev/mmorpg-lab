@@ -58,36 +58,40 @@ async fn main() {
 }
 
 async fn scaler_loop(mut redis_conn: redis::aio::MultiplexedConnection) {
-    let hot_servers_min: usize = std::env::var("HOT_SERVERS_MIN")
-        .unwrap_or("1".to_string())
+    let num_shards: u32 = std::env::var("NUM_SHARDS")
+        .unwrap_or("4".to_string())
         .parse()
-        .unwrap_or(1);
+        .unwrap_or(4);
 
     let mut interval = tokio::time::interval(Duration::from_secs(SCALER_INTERVAL_SECONDS));
 
     loop {
         interval.tick().await;
 
-        let available = count_available_servers(&mut redis_conn).await;
-        println!("[scaler] Available servers: {} (min: {})", available, hot_servers_min);
+        // Keep exactly one live server per shard. A shard with no available
+        // server (never started, or expired via TTL) gets respawned.
+        let live = live_shards(&mut redis_conn).await;
+        println!("[scaler] Live shards: {:?} (want 0..{})", live, num_shards);
 
-        for _ in available..hot_servers_min {
-            spawn_server();
+        for shard_id in 0..num_shards {
+            if !live.contains(&shard_id) {
+                spawn_server(shard_id);
+            }
         }
     }
 }
 
-async fn count_available_servers(redis_conn: &mut redis::aio::MultiplexedConnection) -> usize {
+async fn live_shards(redis_conn: &mut redis::aio::MultiplexedConnection) -> std::collections::HashSet<u32> {
     let keys: Vec<String> = redis_conn.keys("server:*").await.unwrap_or_default();
 
-    let mut count = 0;
+    let mut shards = std::collections::HashSet::new();
     for key in &keys {
-        let status: Option<String> = redis_conn.hget(key, "status").await.unwrap_or(None);
-        if status.as_deref() == Some("available") {
-            count += 1;
+        let shard_id: Option<String> = redis_conn.hget(key, "shard_id").await.unwrap_or(None);
+        if let Some(id) = shard_id.and_then(|s| s.parse::<u32>().ok()) {
+            shards.insert(id);
         }
     }
-    count
+    shards
 }
 
 fn find_free_port() -> u16 {
@@ -96,7 +100,7 @@ fn find_free_port() -> u16 {
     socket.local_addr().unwrap().port()
 }
 
-fn spawn_server() {
+fn spawn_server(shard_id: u32) {
     let port = find_free_port();
 
     // The dedicated_server binary sits next to this binary in the same target directory.
@@ -105,13 +109,18 @@ fn spawn_server() {
     binary_path.push("dedicated_server");
 
     let orch_addr = std::env::var("ORCH_ADDR").unwrap_or("127.0.0.1:9000".to_string());
+    let broker_addr = std::env::var("BROKER_ADDR").unwrap_or("127.0.0.1:9010".to_string());
+    let spatial_addr = std::env::var("SPATIAL_ADDR").unwrap_or("127.0.0.1:9001".to_string());
 
     match std::process::Command::new(&binary_path)
         .env("DS_PORT", port.to_string())
+        .env("DS_SHARD_ID", shard_id.to_string())
         .env("ORCHESTRATOR_ADDR", orch_addr)
+        .env("BROKER_ADDR", broker_addr)
+        .env("SPATIAL_ADDR", spatial_addr)
         .spawn()
     {
-        Ok(_)  => println!("[scaler] Spawned dedicated_server on port {}", port),
+        Ok(_)  => println!("[scaler] Spawned dedicated_server for shard {} on port {}", shard_id, port),
         Err(e) => eprintln!("[scaler] Failed to spawn dedicated_server: {}", e),
     }
 }
@@ -130,6 +139,7 @@ async fn register_server(redis_conn: &mut redis::aio::MultiplexedConnection, hea
             ("ip",           heartbeat.ip.as_str()),
             ("port",         &heartbeat.port.to_string()),
             ("zone",         heartbeat.zone.as_str()),
+            ("shard_id",     &heartbeat.shard_id.to_string()),
             ("status",       status),
             ("player_count", &heartbeat.player_count.to_string()),
         ])
